@@ -1,10 +1,14 @@
 import os
 import re
+import math
+import time
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Lock
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import errors, types
@@ -27,8 +31,50 @@ from rag import PortfolioRetriever
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+CHAT_COOLDOWN_SECONDS = int(os.getenv("CHAT_COOLDOWN_SECONDS", "5"))
+CHAT_HOURLY_LIMIT = int(os.getenv("CHAT_HOURLY_LIMIT", "30"))
 MIN_RELEVANCE = 0.05
 MIN_SCOPE_RELEVANCE = 0.10
+
+
+class ChatRateLimiter:
+    def __init__(self, cooldown_seconds: int, hourly_limit: int):
+        self.cooldown_seconds = cooldown_seconds
+        self.hourly_limit = hourly_limit
+        self.requests: dict[str, deque[float]] = defaultdict(deque)
+        self.lock = Lock()
+
+    def check(self, client_id: str) -> None:
+        now = time.monotonic()
+        hour_ago = now - 3600
+
+        with self.lock:
+            timestamps = self.requests[client_id]
+            while timestamps and timestamps[0] <= hour_ago:
+                timestamps.popleft()
+
+            if timestamps:
+                cooldown_remaining = self.cooldown_seconds - (now - timestamps[-1])
+                if cooldown_remaining > 0:
+                    retry_after = math.ceil(cooldown_remaining)
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"กรุณารออีก {retry_after} วินาทีก่อนส่งคำถามถัดไป",
+                        headers={"Retry-After": str(retry_after)},
+                    )
+
+            if len(timestamps) >= self.hourly_limit:
+                retry_after = math.ceil(3600 - (now - timestamps[0]))
+                raise HTTPException(
+                    status_code=429,
+                    detail="คุณถามครบจำนวนที่กำหนดต่อชั่วโมงแล้ว กรุณาลองใหม่ภายหลัง",
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+            timestamps.append(now)
+
+
+chat_rate_limiter = ChatRateLimiter(CHAT_COOLDOWN_SECONDS, CHAT_HOURLY_LIMIT)
 
 
 
@@ -128,6 +174,9 @@ def health(request: Request):
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, request: Request):
+    client_id = request.client.host if request.client else "unknown"
+    chat_rate_limiter.check(client_id)
+
     immediate_response = guarded_response(payload.question)
     if immediate_response:
         return ChatResponse(answer=immediate_response, sources=[], mode="guard")
