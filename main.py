@@ -26,6 +26,7 @@ from rag import PortfolioRetriever
 
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MIN_RELEVANCE = 0.05
 MIN_SCOPE_RELEVANCE = 0.10
 
@@ -43,6 +44,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[Source]
     mode: str
+    model: str = MODEL_NAME
 
 
 def guarded_response(question: str, contexts: list[dict] | None = None) -> str | None:
@@ -117,7 +119,11 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health(request: Request):
-    return {"status": "ok", "gemini_configured": request.app.state.gemini is not None}
+    return {
+        "status": "ok",
+        "gemini_configured": request.app.state.gemini is not None,
+        "model": MODEL_NAME,
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -150,7 +156,7 @@ def chat(payload: ChatRequest, request: Request):
     )
     try:
         response = request.app.state.gemini.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+            model=MODEL_NAME,
             contents=f"คำถาม: {payload.question}\n\nข้อมูลจาก Portfolio:\n{context_text}",
             config=types.GenerateContentConfig(
                 system_instruction=(
