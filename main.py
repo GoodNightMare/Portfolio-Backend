@@ -11,6 +11,17 @@ from google.genai import errors, types
 import httpx
 from pydantic import BaseModel, Field
 
+from intents import (
+    ALL_TERMS,
+    GOODBYE_TERMS,
+    GREETING_TERMS,
+    HOW_ARE_YOU_TERMS,
+    MEAL_TERMS,
+    OUT_OF_SCOPE_TERMS,
+    PROJECT_TERMS,
+    SENSITIVE_TERMS,
+    THANKS_TERMS,
+)
 from rag import PortfolioRetriever
 
 load_dotenv()
@@ -18,18 +29,6 @@ BASE_DIR = Path(__file__).resolve().parent
 MIN_RELEVANCE = 0.05
 MIN_SCOPE_RELEVANCE = 0.10
 
-GREETING_TERMS = ("สวัสดี", "หวัดดี", "hello", "hi", "hey")
-MEAL_TERMS = ("กินข้าว", "กินอะไร", "หิวไหม", "หิวหรือยัง", "ทานข้าว")
-SENSITIVE_TERMS = (
-    "api key", "apikey", "gemini_api_key", ".env", "รหัสผ่าน", "password",
-    "system prompt", "system_instruction", "เปิดเผย prompt", "บอก prompt",
-)
-OUT_OF_SCOPE_TERMS = (
-    "อากาศ", "พยากรณ์", "หวย", "ราคาหุ้น", "คริปโต", "ข่าววันนี้",
-    "การเมือง", "ฟุตบอล", "ผลบอล", "ดูดวง", "ทำการบ้านให้",
-)
-PROJECT_TERMS = ("โปรเจกต์", "โปรเจค", "project", "ผลงาน")
-ALL_TERMS = ("ทั้งหมด", "มีอะไรบ้าง", "ทุกโปรเจกต์", "all projects")
 
 
 class ChatRequest(BaseModel):
@@ -48,6 +47,7 @@ class ChatResponse(BaseModel):
 
 def guarded_response(question: str, contexts: list[dict] | None = None) -> str | None:
     normalized = " ".join(question.lower().split())
+    exact = normalized.strip("!?., ")
 
     if any(term in normalized for term in SENSITIVE_TERMS):
         return "ขออภัยครับ ผมไม่สามารถเปิดเผย API key, Prompt หรือข้อมูลระบบภายในได้ แต่ถามเรื่องประวัติ ทักษะ และผลงานของไนท์ได้นะครับ"
@@ -55,8 +55,17 @@ def guarded_response(question: str, contexts: list[dict] | None = None) -> str |
     if any(term in normalized for term in MEAL_TERMS):
         return "ผมเป็น AI ประจำ Portfolio จึงกินข้าวไม่ได้ครับ 😄 ลองถามเกี่ยวกับประวัติ ทักษะ หรือผลงานของไนท์ได้นะครับ"
 
-    if len(normalized) <= 24 and any(normalized.startswith(term) for term in GREETING_TERMS):
+    if exact in GREETING_TERMS:
         return "สวัสดีครับ 👋 อยากรู้เรื่องประวัติ ทักษะ หรือผลงานส่วนไหนของไนท์ครับ?"
+
+    if exact in THANKS_TERMS:
+        return "ยินดีครับ 😊 หากอยากรู้เรื่องอื่นเกี่ยวกับไนท์ ถามต่อได้เลยครับ"
+
+    if exact in GOODBYE_TERMS:
+        return "ขอบคุณที่เข้ามาคุยกันครับ แล้วพบกันใหม่ 👋"
+
+    if exact in HOW_ARE_YOU_TERMS:
+        return "สบายดีครับ 😊 ผมพร้อมช่วยตอบคำถามเกี่ยวกับไนท์ มีเรื่องไหนอยากทราบเป็นพิเศษไหมครับ?"
 
     if any(term in normalized for term in OUT_OF_SCOPE_TERMS):
         return "คำถามนี้อยู่นอกขอบเขตของ Portfolio ครับ ผมช่วยตอบเกี่ยวกับประวัติ การศึกษา ทักษะ โปรเจกต์ กิจกรรม และการติดต่อไนท์ได้ครับ"
