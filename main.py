@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,6 +28,8 @@ OUT_OF_SCOPE_TERMS = (
     "อากาศ", "พยากรณ์", "หวย", "ราคาหุ้น", "คริปโต", "ข่าววันนี้",
     "การเมือง", "ฟุตบอล", "ผลบอล", "ดูดวง", "ทำการบ้านให้",
 )
+PROJECT_TERMS = ("โปรเจกต์", "โปรเจค", "project", "ผลงาน")
+ALL_TERMS = ("ทั้งหมด", "มีอะไรบ้าง", "ทุกโปรเจกต์", "all projects")
 
 
 class ChatRequest(BaseModel):
@@ -62,6 +65,14 @@ def guarded_response(question: str, contexts: list[dict] | None = None) -> str |
         return "ยังไม่พบข้อมูลเรื่องนี้ใน Portfolio ของไนท์ครับ ลองถามเกี่ยวกับประวัติ การศึกษา ทักษะ โปรเจกต์ กิจกรรม หรือช่องทางติดต่อดูนะครับ"
 
     return None
+
+
+def wants_all_projects(question: str) -> bool:
+    normalized = question.lower()
+    return (
+        any(term in normalized for term in PROJECT_TERMS)
+        and any(term in normalized for term in ALL_TERMS)
+    )
 
 
 def fallback_answer(contexts: list[dict]) -> str:
@@ -106,6 +117,16 @@ def chat(payload: ChatRequest, request: Request):
     if immediate_response:
         return ChatResponse(answer=immediate_response, sources=[], mode="guard")
 
+    if wants_all_projects(payload.question):
+        projects = request.app.state.retriever.project_documents()
+        names = [re.sub(r"^\d+\.\s*", "", project.title) for project in projects]
+        answer = "โปรเจกต์ทั้งหมดของไนท์ ได้แก่ " + ", ".join(names) + " ครับ"
+        return ChatResponse(
+            answer=answer,
+            sources=[Source(title=project.title) for project in projects],
+            mode="retrieval",
+        )
+
     contexts = request.app.state.retriever.search(payload.question)
     scope_response = guarded_response(payload.question, contexts)
     if scope_response:
@@ -126,7 +147,8 @@ def chat(payload: ChatRequest, request: Request):
                 system_instruction=(
                     "คุณคือ Night AI และเป็น ผู้ชาย ตอบคำถามเกี่ยวกับนนท์ธีร์ ปานะถึก "
                     "ตอบภาษาเดียวกับคำถามอย่างสุภาพและกระชับ ใช้เฉพาะข้อมูลที่ให้มา "
-                    "ห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกว่าไม่พบใน Portfolio"
+                    "ห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกว่าไม่พบใน Portfolio "
+                    "ตอบเป็นข้อความธรรมดา ไม่ใช้ Markdown หรือเครื่องหมายดอกจันเพื่อเน้นข้อความ"
                 ),
                 temperature=0.2,
                 max_output_tokens=400,

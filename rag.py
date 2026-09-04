@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 QUERY_EXPANSIONS = (
+    (("คือใคร", "แนะนำตัว", "ประวัติ", "ชื่ออะไร", "who is", "about night"),
+     "ประวัติ นนท์ธีร์ ปานะถึก ไนท์ ชื่อ สถานะปัจจุบัน นักศึกษา"),
     (("เรียนอยู่ไหน", "เรียนที่ไหน", "ศึกษาอยู่ไหน", "ศึกษาอยู่ที่ไหน", "มหาลัย", "มหาวิทยาลัย"),
      "ประวัติ มหาวิทยาลัย คณะ สาขา สถานะนักศึกษา"),
     (("เรียนอะไร", "เรียนสาขา", "สาขาอะไร", "คณะอะไร"),
@@ -87,3 +89,10 @@ class PortfolioRetriever:
             "text": self.documents[index].text,
             "score": float(scores[index]),
         } for index in indices]
+
+    def project_documents(self) -> list[Document]:
+        return [
+            document
+            for document in self.documents
+            if re.match(r"^(1[2-9]|20|21)\.\s", document.title)
+        ]
