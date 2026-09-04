@@ -1,0 +1,140 @@
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import errors, types
+import httpx
+from pydantic import BaseModel, Field
+
+from rag import PortfolioRetriever
+
+load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+MIN_RELEVANCE = 0.05
+MIN_SCOPE_RELEVANCE = 0.10
+
+GREETING_TERMS = ("สวัสดี", "หวัดดี", "hello", "hi", "hey")
+MEAL_TERMS = ("กินข้าว", "กินอะไร", "หิวไหม", "หิวหรือยัง", "ทานข้าว")
+SENSITIVE_TERMS = (
+    "api key", "apikey", "gemini_api_key", ".env", "รหัสผ่าน", "password",
+    "system prompt", "system_instruction", "เปิดเผย prompt", "บอก prompt",
+)
+OUT_OF_SCOPE_TERMS = (
+    "อากาศ", "พยากรณ์", "หวย", "ราคาหุ้น", "คริปโต", "ข่าววันนี้",
+    "การเมือง", "ฟุตบอล", "ผลบอล", "ดูดวง", "ทำการบ้านให้",
+)
+
+
+class ChatRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+
+
+class Source(BaseModel):
+    title: str
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[Source]
+    mode: str
+
+
+def guarded_response(question: str, contexts: list[dict] | None = None) -> str | None:
+    normalized = " ".join(question.lower().split())
+
+    if any(term in normalized for term in SENSITIVE_TERMS):
+        return "ขออภัยครับ ผมไม่สามารถเปิดเผย API key, Prompt หรือข้อมูลระบบภายในได้ แต่ถามเรื่องประวัติ ทักษะ และผลงานของไนท์ได้นะครับ"
+
+    if any(term in normalized for term in MEAL_TERMS):
+        return "ผมเป็น AI ประจำ Portfolio จึงกินข้าวไม่ได้ครับ 😄 ลองถามเกี่ยวกับประวัติ ทักษะ หรือผลงานของไนท์ได้นะครับ"
+
+    if len(normalized) <= 24 and any(normalized.startswith(term) for term in GREETING_TERMS):
+        return "สวัสดีครับ 👋 อยากรู้เรื่องประวัติ ทักษะ หรือผลงานส่วนไหนของไนท์ครับ?"
+
+    if any(term in normalized for term in OUT_OF_SCOPE_TERMS):
+        return "คำถามนี้อยู่นอกขอบเขตของ Portfolio ครับ ผมช่วยตอบเกี่ยวกับประวัติ การศึกษา ทักษะ โปรเจกต์ กิจกรรม และการติดต่อไนท์ได้ครับ"
+
+    if contexts and contexts[0]["score"] < MIN_SCOPE_RELEVANCE:
+        return "ยังไม่พบข้อมูลเรื่องนี้ใน Portfolio ของไนท์ครับ ลองถามเกี่ยวกับประวัติ การศึกษา ทักษะ โปรเจกต์ กิจกรรม หรือช่องทางติดต่อดูนะครับ"
+
+    return None
+
+
+def fallback_answer(contexts: list[dict]) -> str:
+    if not contexts or contexts[0]["score"] < MIN_RELEVANCE:
+        return "ยังไม่พบข้อมูลเรื่องนี้ใน Portfolio ของไนท์ ลองถามเกี่ยวกับประวัติ ทักษะ โปรเจกต์ การฝึกงาน หรือช่องทางติดต่อดูนะครับ"
+    text = " ".join(context["text"] for context in contexts[:2])
+    return f"ขณะนี้ระบบ AI ไม่พร้อมให้บริการชั่วคราว แต่ยังค้นข้อมูลจาก Portfolio ให้ได้ครับ: {text}"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.retriever = PortfolioRetriever(BASE_DIR / "knowledge")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    app.state.gemini = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=15_000),
+    ) if api_key else None
+    yield
+    if app.state.gemini:
+        app.state.gemini.close()
+
+
+app = FastAPI(title="Night Portfolio RAG", lifespan=lifespan)
+origins = [item.strip() for item in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if item.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+
+@app.get("/api/health")
+def health(request: Request):
+    return {"status": "ok", "gemini_configured": request.app.state.gemini is not None}
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(payload: ChatRequest, request: Request):
+    immediate_response = guarded_response(payload.question)
+    if immediate_response:
+        return ChatResponse(answer=immediate_response, sources=[], mode="guard")
+
+    contexts = request.app.state.retriever.search(payload.question)
+    scope_response = guarded_response(payload.question, contexts)
+    if scope_response:
+        return ChatResponse(answer=scope_response, sources=[], mode="guard")
+
+    sources = [Source(title=item["title"]) for item in contexts if item["score"] >= MIN_RELEVANCE]
+    if not request.app.state.gemini:
+        return ChatResponse(answer=fallback_answer(contexts), sources=sources, mode="fallback")
+
+    context_text = "\n\n".join(
+        f"แหล่งข้อมูล: {item['title']}\n{item['text']}" for item in contexts
+    )
+    try:
+        response = request.app.state.gemini.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+            contents=f"คำถาม: {payload.question}\n\nข้อมูลจาก Portfolio:\n{context_text}",
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "คุณคือ Night AI และเป็น ผู้ชาย ตอบคำถามเกี่ยวกับนนท์ธีร์ ปานะถึก "
+                    "ตอบภาษาเดียวกับคำถามอย่างสุภาพและกระชับ ใช้เฉพาะข้อมูลที่ให้มา "
+                    "ห้ามแต่งข้อมูล หากข้อมูลไม่พอให้บอกว่าไม่พบใน Portfolio"
+                ),
+                temperature=0.2,
+                max_output_tokens=400,
+            ),
+        )
+        answer = (response.text or "").strip()
+        if not answer:
+            raise ValueError("empty response")
+        return ChatResponse(answer=answer, sources=sources, mode="ai")
+    except (errors.APIError, httpx.HTTPError, ValueError, OSError, RuntimeError):
+        return ChatResponse(answer=fallback_answer(contexts), sources=sources, mode="fallback")
