@@ -2,6 +2,7 @@ import os
 import re
 import math
 import time
+import logging
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +36,13 @@ CHAT_COOLDOWN_SECONDS = int(os.getenv("CHAT_COOLDOWN_SECONDS", "5"))
 CHAT_HOURLY_LIMIT = int(os.getenv("CHAT_HOURLY_LIMIT", "30"))
 MIN_RELEVANCE = 0.05
 MIN_SCOPE_RELEVANCE = 0.10
+logger = logging.getLogger(__name__)
+
+
+def record_gemini_failure(error: Exception) -> None:
+    # Do not log exception bodies: upstream messages may contain request data.
+    logger.warning("Gemini request failed: model=%s type=%s code=%s", MODEL_NAME,
+                   type(error).__name__, getattr(error, "code", None))
 
 
 class ChatRateLimiter:
@@ -141,11 +149,14 @@ def fallback_answer(contexts: list[dict]) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.readiness_lock = Lock()
+    app.state.ready_until = 0.0
+    app.state.gemini_ready = False
     app.state.retriever = PortfolioRetriever(BASE_DIR / "knowledge")
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     app.state.gemini = genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=15_000),
+        http_options=types.HttpOptions(timeout=30_000),
     ) if api_key else None
     yield
     if app.state.gemini:
@@ -170,6 +181,31 @@ def health(request: Request):
         "gemini_configured": request.app.state.gemini is not None,
         "model": MODEL_NAME,
     }
+
+
+@app.get("/api/ready")
+def readiness(request: Request):
+    state = request.app.state
+    if state.gemini is None:
+        logger.warning("Gemini unavailable: GEMINI_API_KEY is missing")
+        return {"ready": False, "model": MODEL_NAME}
+    # Share a short cache across visitors so opening the chat does not spam Gemini.
+    with state.readiness_lock:
+        if time.monotonic() >= state.ready_until:
+            try:
+                response = state.gemini.models.generate_content(
+                    model=MODEL_NAME,
+                    contents="Reply with OK only.",
+                    config=types.GenerateContentConfig(max_output_tokens=32),
+                )
+                if not (response.text or "").strip():
+                    raise ValueError("empty response")
+                state.gemini_ready = True
+            except (errors.APIError, httpx.HTTPError, ValueError, OSError, RuntimeError) as error:
+                record_gemini_failure(error)
+                state.gemini_ready = False
+            state.ready_until = time.monotonic() + (60 if state.gemini_ready else 15)
+        return {"ready": state.gemini_ready, "model": MODEL_NAME}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -222,5 +258,9 @@ def chat(payload: ChatRequest, request: Request):
         if not answer:
             raise ValueError("empty response")
         return ChatResponse(answer=answer, sources=sources, mode="ai")
-    except (errors.APIError, httpx.HTTPError, ValueError, OSError, RuntimeError):
+    except (errors.APIError, httpx.HTTPError, ValueError, OSError, RuntimeError) as error:
+        record_gemini_failure(error)
+        with request.app.state.readiness_lock:
+            request.app.state.gemini_ready = False
+            request.app.state.ready_until = time.monotonic() + 15
         return ChatResponse(answer=fallback_answer(contexts), sources=sources, mode="fallback")
